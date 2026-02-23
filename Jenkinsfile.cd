@@ -2,7 +2,7 @@ pipeline {
     agent any
 
     environment {
-        AWS_REGION = 'us-east-1'
+        AWS_REGION = 'ap-south-1'
         ECS_CLUSTER = 'hospital-management-prod-cluster'
         ECS_SERVICE = 'patient-portal'
     }
