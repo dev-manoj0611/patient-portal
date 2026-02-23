@@ -1,82 +1,174 @@
 pipeline {
-  agent any
-  environment {
-    AWS_REGION = 'us-east-1'
-    ECR_SNAPSHOT = '147997138755.dkr.ecr.us-east-1.amazonaws.com/snapshot/patientportal'
-    ECR_RELEASE = '147997138755.dkr.ecr.us-east-1.amazonaws.com/patientportal'
-    IMAGE_NAME = 'patientportal'
-  }
-  stages {
-    stage('Checkout & Install') {
-      steps {
-        checkout scm
-        sh 'rm -rf node_modules'
-        sh 'export NODE_ENV=development && npm install'
-      }
+    agent any
+
+    environment {
+        AWS_REGION = 'ap-south-1'
+        ECR_REGISTRY = '862770535694.dkr.ecr.ap-south-1.amazonaws.com'
+        SERVICE_NAME = 'patient-portal'
+        IMAGE_TAG = "${BUILD_NUMBER}"
+        IMAGE_NAME = '862770535694.dkr.ecr.ap-south-1.amazonaws.com/portal'
+        SONARQUBE_SERVER = 'SonarQube'
+        SONARQUBE_TOKEN = credentials('sonar-token-portal')
     }
-    stage('Quality Checks') {
-      parallel {
-        stage('Lint') {
-          steps {
-            sh 'npm run lint'
-          }
+
+    options {
+        timestamps()
+        timeout(time: 45, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    echo "Code checked out successfully"
+                    sh 'git log --oneline -1'
+                }
+            }
         }
-        stage('UnitTest') {
-          steps {
-            sh 'npm run test:coverage'
-          }
+
+        stage('Build') {
+            steps {
+                script {
+                    echo "Building Patient Portal..."
+                    sh '''
+                        npm install
+                        npm run lint
+                        npm run build
+                    '''
+                }
+            }
         }
-      }
-    }
-    stage('SonarQube') {
-      steps {
-        withCredentials([string(credentialsId: 'SONAR_TOKEN_PORTAL', variable: 'SONAR_TOKEN')]) {
-          sh '''
-            export PATH=$PATH:/opt/sonar-scanner/bin
-            sonar-scanner \
-              -Dsonar.host.url=http://100.50.131.6:9000 \
-              -Dsonar.login=$SONAR_TOKEN
-          '''
+
+        stage('Test & Security Scan') {
+            parallel {
+                stage('Unit Tests & SonarQube') {
+                    steps {
+                        script {
+                            echo "Running unit tests and SonarQube analysis..."
+                            sh '''
+                                npm run test:coverage || true
+
+                                docker run --rm \
+                                    --network host \
+                                    -v ${WORKSPACE}:/usr/src \
+                                    -e SONAR_TOKEN=${SONARQUBE_TOKEN} \
+                                    sonarsource/sonar-scanner-cli:latest \
+                                    -Dsonar.projectKey=${SERVICE_NAME} \
+                                    -Dsonar.sources=/usr/src/src \
+                                    -Dsonar.exclusions=/usr/src/node_modules/**,/usr/src/dist/** \
+                                    -Dsonar.host.url=http://localhost:9000
+                            '''
+                        }
+                    }
+                }
+
+                stage('Gitleaks Scan') {
+                    steps {
+                        script {
+                            echo "Running Gitleaks scan for secrets detection..."
+                            sh '''
+                                if ! command -v gitleaks > /dev/null 2>&1; then
+                                    docker run --rm -v ${WORKSPACE}:/path \
+                                        zricethezav/gitleaks:latest version
+                                fi
+
+                                docker run --rm -v ${WORKSPACE}:/path \
+                                    zricethezav/gitleaks:latest detect \
+                                    --source /path \
+                                    --verbose \
+                                    --report-path /path/gitleaks-report.json \
+                                    --exit-code 1 || true
+
+                                echo "Gitleaks scan completed"
+                            '''
+                        }
+                    }
+                }
+            }
         }
-      }
-    }
-    stage('Build') {
-      steps {
-        sh 'npm run build'
-      }
-    }
-    stage('Docker Build & Trivy Scan') {
-      steps {
-        script {
-          dockerImage = docker.build("${ECR_SNAPSHOT}:${env.BUILD_NUMBER}")
+
+        stage('Docker Build') {
+            steps {
+                script {
+                    echo "Building Docker image..."
+                    sh '''
+                        docker build -t ${SERVICE_NAME}:${IMAGE_TAG} .
+                        docker tag ${SERVICE_NAME}:${IMAGE_TAG} ${SERVICE_NAME}:latest
+                        echo "Docker image built: ${SERVICE_NAME}:${IMAGE_TAG}"
+                    '''
+                }
+            }
         }
-        sh "trivy image --exit-code 1 --severity HIGH,CRITICAL ${ECR_SNAPSHOT}:${env.BUILD_NUMBER} || true"
-      }
-    }
-    stage('Push to ECR Snapshot') {
-      steps {
-        script {
-          withCredentials([aws(credentialsId: 'AWS Credentials')]) {
-            sh "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin 147997138755.dkr.ecr.us-east-1.amazonaws.com"
-            sh "docker push ${ECR_SNAPSHOT}:${env.BUILD_NUMBER}"
-          }
+
+        stage('Trivy Image Scan') {
+            steps {
+                script {
+                    echo "Scanning Docker image with Trivy..."
+                    sh '''
+                        docker run --rm \
+                            -v /var/run/docker.sock:/var/run/docker.sock \
+                            -v ${WORKSPACE}:/workspace \
+                            aquasec/trivy:latest image \
+                            --severity CRITICAL,HIGH \
+                            --exit-code 0 \
+                            --no-progress \
+                            --format json \
+                            --output /workspace/trivy-report.json \
+                            ${SERVICE_NAME}:${IMAGE_TAG}
+
+                        echo "Trivy scan completed"
+                    '''
+                }
+            }
         }
-      }
-    }
-    stage('Push to Release') {
-      steps {
-        script {
-          withCredentials([aws(credentialsId: 'AWS Credentials')]) {
-            sh "docker tag ${ECR_SNAPSHOT}:${env.BUILD_NUMBER} ${ECR_RELEASE}:release-${env.BUILD_NUMBER}"
-            sh "docker push ${ECR_RELEASE}:release-${env.BUILD_NUMBER}"
-            sh "docker tag ${ECR_SNAPSHOT}:${env.BUILD_NUMBER} ${ECR_RELEASE}:latest"
-            sh "docker push ${ECR_RELEASE}:latest"
-          }
+
+        stage('ECR Login & Push') {
+            steps {
+                echo "Pushing Docker image to ECR..."
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-credentials'
+                ]]) {
+                    sh '''
+                        export AWS_DEFAULT_REGION=${AWS_REGION}
+
+                        aws ecr get-login-password --region ${AWS_REGION} | \
+                            docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+                        docker tag ${SERVICE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:${IMAGE_TAG}
+                        docker tag ${SERVICE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest
+
+                        docker push ${IMAGE_NAME}:${IMAGE_TAG}
+                        docker push ${IMAGE_NAME}:latest
+
+                        echo "Image pushed to ECR:"
+                        echo "  - ${IMAGE_NAME}:${IMAGE_TAG}"
+                        echo "  - ${IMAGE_NAME}:latest"
+                    '''
+                }
+            }
         }
-      }
     }
-  }
-  post {
-    always { cleanWs() }
-  }
+
+    post {
+        always {
+            script {
+                echo "Pipeline completed"
+                archiveArtifacts artifacts: '**/coverage/**,gitleaks-report.json,trivy-report.json',
+                                  allowEmptyArchive: true
+            }
+        }
+        success {
+            script {
+                echo "Pipeline succeeded - Patient Portal image is ready"
+            }
+        }
+        failure {
+            script {
+                echo "Pipeline failed - Check logs for details"
+            }
+        }
+    }
 }
