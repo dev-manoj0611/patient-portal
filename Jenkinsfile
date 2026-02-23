@@ -8,7 +8,7 @@ pipeline {
         IMAGE_TAG = "${BUILD_NUMBER}"
         IMAGE_NAME = '862770535694.dkr.ecr.ap-south-1.amazonaws.com/portal'
         SONARQUBE_SERVER = 'SonarQube'
-        SONARQUBE_TOKEN = credentials('sonar-token-portal')
+        SONARQUBE_TOKEN = credentials('sonar_token_portal')
     }
 
     options {
