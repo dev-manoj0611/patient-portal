@@ -1,10 +1,15 @@
 pipeline {
     agent any
 
+    parameters {
+        string(name: 'IMAGE_TAG', defaultValue: 'latest', description: 'ECR image tag to deploy (e.g. 42 or latest)')
+    }
+
     environment {
         AWS_REGION = 'ap-south-1'
         ECS_CLUSTER = 'hospital-management-prod-cluster'
         ECS_SERVICE = 'patient-portal'
+        IMAGE_REPOSITORY = '862770535694.dkr.ecr.ap-south-1.amazonaws.com/portal'
     }
 
     options {
@@ -21,17 +26,76 @@ pipeline {
                     credentialsId: 'aws-credentials'
                 ]]) {
                     sh '''
+                        set -euo pipefail
+
                         export AWS_DEFAULT_REGION=${AWS_REGION}
                         aws sts get-caller-identity
 
+                        CURRENT_TASK_DEF=$(aws ecs describe-services \
+                            --cluster "${ECS_CLUSTER}" \
+                            --services "${ECS_SERVICE}" \
+                            --query "services[0].taskDefinition" \
+                            --output text)
+
+                        export IMAGE_URI="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+                        echo "Deploying image: ${IMAGE_URI}"
+                        echo "Current task definition: ${CURRENT_TASK_DEF}"
+
+                        aws ecs describe-task-definition \
+                            --task-definition "${CURRENT_TASK_DEF}" \
+                            --query "taskDefinition" \
+                            --output json > taskdef.json
+
+                        python3 - <<'PY'
+import json
+import os
+
+service_name = os.environ['ECS_SERVICE']
+image_uri = os.environ['IMAGE_URI']
+
+with open('taskdef.json', 'r', encoding='utf-8') as f:
+    taskdef = json.load(f)
+
+for field in [
+    'taskDefinitionArn',
+    'revision',
+    'status',
+    'requiresAttributes',
+    'compatibilities',
+    'registeredAt',
+    'registeredBy'
+]:
+    taskdef.pop(field, None)
+
+updated = False
+for container in taskdef.get('containerDefinitions', []):
+    if container.get('name') == service_name:
+        container['image'] = image_uri
+        updated = True
+        break
+
+if not updated:
+    raise RuntimeError(f'Container {service_name} not found in task definition')
+
+with open('taskdef-updated.json', 'w', encoding='utf-8') as f:
+    json.dump(taskdef, f)
+PY
+
+                        NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+                            --cli-input-json file://taskdef-updated.json \
+                            --query "taskDefinition.taskDefinitionArn" \
+                            --output text)
+
+                        echo "Registered task definition: ${NEW_TASK_DEF_ARN}"
+
                         aws ecs update-service \
-                            --cluster ${ECS_CLUSTER} \
-                            --service ${ECS_SERVICE} \
-                            --force-new-deployment
+                            --cluster "${ECS_CLUSTER}" \
+                            --service "${ECS_SERVICE}" \
+                            --task-definition "${NEW_TASK_DEF_ARN}"
 
                         aws ecs wait services-stable \
-                            --cluster ${ECS_CLUSTER} \
-                            --services ${ECS_SERVICE}
+                            --cluster "${ECS_CLUSTER}" \
+                            --services "${ECS_SERVICE}"
                     '''
                 }
             }
